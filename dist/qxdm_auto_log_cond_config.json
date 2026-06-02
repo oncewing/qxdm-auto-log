@@ -14,7 +14,11 @@
       "cmd": "ifconfig",
       "expected": "192.0.0.2",
       "normal_when": "found",
-      "timeout": 10
+      "timeout": 15
+    },
+    {
+      "type": "FUNCTION",
+      "code": "import re\n\ndef check_rmnet_ipv6():\n    out = adb_shell(\"ip -6 addr show 2>/dev/null\")\n    iface = \"\"\n    for line in out.splitlines():\n        m = re.match(r\"\\s*\\d+:\\s*(rmnet_data\\d+)[@:]\", line)\n        if m:\n            iface = m.group(1)\n            continue\n        if iface and \"inet6\" in line and \"scope global\" in line:\n            addr = line.strip().split()[1]\n            return True, f\"{iface} IPv6={addr}\"\n    return False, \"rmnet_data 글로벌 IPv6 없음\"\n\nreturn check_rmnet_ipv6()"
     }
   ]
 }

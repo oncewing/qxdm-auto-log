@@ -97,8 +97,8 @@ def adb_shell(cmd, timeout=10):
             capture_output=True, text=True, timeout=timeout,
             creationflags=_NO_WINDOW,
         )
-        return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return (result.stdout or "").strip()
+    except Exception as e:
         print(f"  [adb 오류] {e}")
         return ""
 
@@ -352,6 +352,7 @@ if out:
     return True, "normal"    # 정상
 return False, "error"        # 비정상
 """
+
 
 DEFAULT_CONDITIONS = [
     {"type": "SHELL", "cmd": "cat /var/tmp/test_result", "expected": "error", "timeout": 15, "normal_when": "not_found"}    

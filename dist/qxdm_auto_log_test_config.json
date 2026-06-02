@@ -5,7 +5,7 @@
       "label": "LPM",
       "type": "AT",
       "cmd": "AT+CFUN=4",
-      "base_sec": 5,
+      "base_sec": 10,
       "rand_min": 5,
       "rand_max": 10
     },
@@ -13,7 +13,7 @@
       "label": "ONLINE",
       "type": "AT",
       "cmd": "AT+CFUN=1",
-      "base_sec": 5,
+      "base_sec": 10,
       "rand_min": 10,
       "rand_max": 15
     }

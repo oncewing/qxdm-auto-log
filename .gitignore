@@ -1,6 +1,5 @@
 # PyInstaller 빌드 출력
 build/
-dist/
 *.spec
 
 # Python

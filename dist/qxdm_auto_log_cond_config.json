@@ -1,0 +1,20 @@
+{
+  "config_type": "conditions_config",
+  "logic": "AND",
+  "conditions": [
+    {
+      "type": "SHELL",
+      "cmd": "ifconfig",
+      "expected": "rmnet_data",
+      "normal_when": "found",
+      "timeout": 15
+    },
+    {
+      "type": "SHELL",
+      "cmd": "ifconfig",
+      "expected": "192.0.0.2",
+      "normal_when": "found",
+      "timeout": 10
+    }
+  ]
+}

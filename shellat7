@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# Shell AT
+#
+
+# remove process cat /dev/smd7
+ps_smd7=
+ps_smd7=`ps |grep smd7 |grep cat| cut -d" " -f1,2`
+ps_smd7=`echo ${ps_smd7//[a-z]/}`
+[ $ps_smd7 ] && kill $ps_smd7
+
+# cat /dev/smd7 for at response printing
+cat /dev/smd7 &
+sleep 0.1
+# send at command
+echo -e "$@\r\n" > /dev/smd7
+sleep 0.1
+
+# remove process cat /dev/smd7
+ps_smd7=
+ps_smd7=`ps |grep smd7 |grep cat| cut -d" " -f1,2`
+ps_smd7=`echo ${ps_smd7//[a-z]/}`
+[ $ps_smd7 ] && kill $ps_smd7
+sleep 0

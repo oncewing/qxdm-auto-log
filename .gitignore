@@ -1,0 +1,14 @@
+# PyInstaller 빌드 출력
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 테스트 로그/결과물
+*.isf
+*.pcap
+*.zip
+*.log

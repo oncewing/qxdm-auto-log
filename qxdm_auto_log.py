@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime
 from collections import deque
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME    = "QXDM AUTO LOG"
 
 try:
@@ -725,6 +725,117 @@ def clear_qxdm_log(win):
 
 
 # ============================================================
+# 유지 단계 (hold phase)
+# ============================================================
+def run_hold_phase(
+    win, save_dir, base_prefix,
+    hold_conditions, hold_condition_logic,
+    hold_rotate_min, hold_keep_files,
+    hold_check_sec, hold_max_min,
+    stop_event,
+):
+    """
+    종료조건 충족 후 유지조건 충족까지 별도 QXDM 로그(유지로그)를 수집.
+    - 유지로그 rolling 파일명: {prefix}_HOLD_{ts}.isf
+    - 유지로그 최종 파일명:   {prefix}_HOLD_FINAL_{ts}.isf
+    - hold_rotate_min 분마다 롤링 저장, hold_keep_files 개 보관
+    """
+    print("\n" + "=" * 60)
+    print(f"[{now_str()}] 유지 단계 시작")
+    print(f"  유지조건 ({len(hold_conditions)}개, 로직: {hold_condition_logic})")
+    print(f"  저장 주기: {hold_rotate_min}분 / 보관: {hold_keep_files}개 / "
+          f"조건 체크 주기: {hold_check_sec}초 / 최대 수집 시간: {hold_max_min}분")
+    print("=" * 60)
+
+    # QXDM 로그 클리어 후 유지로그 수집 시작
+    clear_qxdm_log(win)
+    start_logcat_on_device()
+    start_tcpdump_on_device()
+
+    hold_rolling = RollingISFManager(save_dir, f"{base_prefix}_HOLD", hold_keep_files)
+    last_save_time  = time.time()
+    phase_start     = time.time()
+    hold_max_sec    = hold_max_min * 60
+    check_count     = 0
+
+    while not (stop_event and stop_event.is_set()):
+        # 체크 주기 대기 (1초 단위로 stop_event·최대시간 감시)
+        for _ in range(hold_check_sec):
+            if stop_event and stop_event.is_set():
+                break
+            if time.time() - phase_start >= hold_max_sec:
+                break
+            time.sleep(1)
+        if stop_event and stop_event.is_set():
+            break
+
+        # 최대 수집 시간 초과 확인
+        elapsed_phase = time.time() - phase_start
+        if elapsed_phase >= hold_max_sec:
+            print(f"\n[{now_str()}] [유지] 최대 수집 시간 {hold_max_min}분 초과 → 유지 단계 종료")
+            stop_logcat_on_device()
+            stop_tcpdump_on_device()
+            break
+
+        check_count += 1
+        elapsed_save = (time.time() - last_save_time) / 60.0
+        remaining    = (hold_max_sec - elapsed_phase) / 60.0
+        print(f"\n[{now_str()}] [유지] 조건 체크 #{check_count}  "
+              f"(마지막 저장 후 {elapsed_save:.1f}분 / 잔여 {remaining:.1f}분)")
+
+        # 유지조건 체크
+        is_hold, reason = run_conditions(
+            hold_conditions, stop_event=stop_event, logic=hold_condition_logic)
+        if stop_event and stop_event.is_set():
+            break
+
+        if is_hold:
+            print(f"\n  >>> [{now_str()}] [유지] 유지조건 충족 (사유: {reason}) → 유지로그 최종 저장")
+            # 유지로그 최종 저장
+            hold_final_name = f"{base_prefix}_HOLD_FINAL_{now_filestamp()}.isf"
+            hold_final_path = os.path.join(save_dir, hold_final_name)
+            base_only = os.path.splitext(hold_final_name)[0]
+            try:
+                win.SetISFDirPath(save_dir)
+                win.SetBaseISFFileName(base_only)
+                time.sleep(1)
+            except Exception as e:
+                print(f"  (ISF 경로 설정 경고: {e})")
+            before = set()
+            try:
+                before = set(os.listdir(save_dir))
+            except Exception:
+                pass
+            try:
+                win.SaveItemStore(hold_final_path)
+            except Exception as e:
+                print(f"  [경고] SaveItemStore 실패: {e}")
+            actual = wait_for_saved_file(save_dir, hold_final_path, before)
+            if actual:
+                print(f"  저장 완료: {os.path.basename(actual)}")
+                stop_logcat_on_device()
+                stop_tcpdump_on_device()
+                collect_extra_logs(save_dir, os.path.splitext(os.path.basename(actual))[0])
+            else:
+                print("  경고: 30초 대기 후에도 저장 파일 없음")
+                stop_logcat_on_device()
+                stop_tcpdump_on_device()
+            break
+        else:
+            print(f"     [유지] 조건 미충족 ({reason}) - 계속 수집")
+
+        # 시간 기반 롤링 저장
+        elapsed_min = (time.time() - last_save_time) / 60.0
+        if elapsed_min >= hold_rotate_min:
+            print(f"\n  -> [{now_str()}] [유지] 롤링 저장 ({elapsed_min:.1f}분 경과)")
+            hold_rolling.save_rotation(win)
+            clear_qxdm_log(win)
+            last_save_time = time.time()
+
+    print(f"\n[{now_str()}] 유지 단계 종료")
+
+
+# ============================================================
 # 메인 시나리오
 # ============================================================
 def run_test_scenario(
@@ -736,6 +847,10 @@ def run_test_scenario(
     conditions=None, condition_logic="AND",
     test_steps=None,
     tcpdump_enabled=False,
+    hold_enabled=False,
+    hold_conditions=None, hold_condition_logic="AND",
+    hold_rotate_min=5, hold_keep_files=3,
+    hold_check_sec=30, hold_max_min=60,
 ):
     global _DEVICE_ID, _TCPDUMP_ENABLED
     _DEVICE_ID = device_id
@@ -902,15 +1017,16 @@ def run_test_scenario(
                 time.sleep(1)
                 print(f"  {i+1}/{post_trigger_sec}s")
 
+        # ── 종료로그 저장 ────────────────────────────────────────
         print("\n" + "=" * 60)
-        print(f"[{now_str()}] 최종 로그 저장")
+        print(f"[{now_str()}] 종료로그 저장")
         print("=" * 60)
         if triggered:
-            final_name = f"{base_prefix}_TRIGGER_cycle{triggered_cycle:03d}_{now_filestamp()}.isf"
+            exit_name = f"{base_prefix}_EXIT_cycle{triggered_cycle:03d}_{now_filestamp()}.isf"
         else:
-            final_name = f"{base_prefix}_FINAL_{now_filestamp()}.isf"
-        final_path = os.path.join(save_dir, final_name)
-        base_only  = os.path.splitext(final_name)[0]
+            exit_name = f"{base_prefix}_FINAL_{now_filestamp()}.isf"
+        exit_path = os.path.join(save_dir, exit_name)
+        base_only = os.path.splitext(exit_name)[0]
         try:
             win.SetISFDirPath(save_dir)
             win.SetBaseISFFileName(base_only)
@@ -921,7 +1037,7 @@ def run_test_scenario(
         print(f"총 수집 Item: {win.GetItemCount()}")
         if triggered:
             print(f"트리거 사이클: {triggered_cycle}")
-        print(f"저장 경로: {final_path}")
+        print(f"저장 경로: {exit_path}")
 
         before = set()
         try:
@@ -929,16 +1045,15 @@ def run_test_scenario(
         except Exception:
             pass
         try:
-            win.SaveItemStore(final_path)
+            win.SaveItemStore(exit_path)
         except Exception as e:
             print(f"  [경고] SaveItemStore 실패: {e}")
 
-        actual = wait_for_saved_file(save_dir, final_path, before)
+        actual = wait_for_saved_file(save_dir, exit_path, before)
         if actual:
-            if actual != final_path:
+            if actual != exit_path:
                 print(f"  -> 다른 이름으로 저장: {os.path.basename(actual)}")
             print(f"저장 완료 ({os.path.getsize(actual)/1024:.1f} KB): {os.path.basename(actual)}")
-            # 최종 저장: logcat/tcpdump 종료 후 수집 (마지막 패킷/로그 flush 보장)
             stop_logcat_on_device()
             stop_tcpdump_on_device()
             collect_extra_logs(save_dir, os.path.splitext(os.path.basename(actual))[0])
@@ -953,6 +1068,21 @@ def run_test_scenario(
             for p in kept:
                 kb = os.path.getsize(p) / 1024 if os.path.exists(p) else 0
                 print(f"  - {os.path.basename(p)} ({kb:.1f} KB)")
+
+        # ── 유지 단계 ────────────────────────────────────────────
+        if triggered and hold_enabled and not (stop_event and stop_event.is_set()):
+            if hold_conditions is None:
+                hold_conditions = list(DEFAULT_CONDITIONS)
+            run_hold_phase(
+                win=win, save_dir=save_dir, base_prefix=base_prefix,
+                hold_conditions=hold_conditions,
+                hold_condition_logic=hold_condition_logic,
+                hold_rotate_min=hold_rotate_min,
+                hold_keep_files=hold_keep_files,
+                hold_check_sec=hold_check_sec,
+                hold_max_min=hold_max_min,
+                stop_event=stop_event,
+            )
 
         print(f"\n[{now_str()}] QXDM 종료 중...")
         win.QuitApplication()
@@ -1266,11 +1396,12 @@ class ClatTestGUI:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(4, weight=1)
+        main.rowconfigure(5, weight=1)
 
         self._build_params(main)
         self._build_test_steps_frame(main)
         self._build_conditions_frame(main)
+        self._build_hold_frame(main)
         self._build_controls(main)
         self._build_log(main)
 
@@ -1493,9 +1624,146 @@ class ClatTestGUI:
             self.condition_logic_var.set(DEFAULT_LOGIC)
             self._refresh_conditions_ui()
 
+    # ── 유지 조건 프레임 ────────────────────────────────────────
+    def _build_hold_frame(self, parent):
+        self.hold_conditions     = [dict(c) for c in DEFAULT_CONDITIONS]
+        self.hold_enabled_var    = tk.BooleanVar(value=False)
+        self.hold_rotate_min_var = tk.IntVar(value=5)
+        self.hold_keep_var       = tk.IntVar(value=3)
+        self.hold_check_sec_var  = tk.IntVar(value=30)
+        self.hold_max_min_var    = tk.IntVar(value=60)
+        self.hold_logic_var      = tk.StringVar(value=DEFAULT_LOGIC)
+
+        outer = ttk.LabelFrame(
+            parent, text="유지 조건  (종료 조건 충족 후 — True 시 유지로그 저장 후 종료)",
+            padding=8, style="Section.TLabelframe")
+        outer.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        outer.columnconfigure(0, weight=1)
+        self._hold_outer = outer
+
+        # 활성화 체크박스 + 설정 행
+        top = ttk.Frame(outer)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(top, text="유지 조건 사용",
+                        variable=self.hold_enabled_var,
+                        command=self._toggle_hold).grid(row=0, column=0, sticky="w", padx=(0, 20))
+        ttk.Label(top, text="저장 주기:").grid(row=0, column=1, sticky="w")
+        self.hold_rotate_spin = ttk.Spinbox(
+            top, from_=1, to=1440, textvariable=self.hold_rotate_min_var,
+            width=5, state="disabled")
+        self.hold_rotate_spin.grid(row=0, column=2, padx=(4, 2))
+        ttk.Label(top, text="분").grid(row=0, column=3, sticky="w", padx=(0, 20))
+        ttk.Label(top, text="보관:").grid(row=0, column=4, sticky="w")
+        self.hold_keep_spin = ttk.Spinbox(
+            top, from_=1, to=99, textvariable=self.hold_keep_var,
+            width=4, state="disabled")
+        self.hold_keep_spin.grid(row=0, column=5, padx=(4, 2))
+        ttk.Label(top, text="개").grid(row=0, column=6, sticky="w", padx=(0, 20))
+        ttk.Label(top, text="체크 주기:").grid(row=0, column=7, sticky="w")
+        self.hold_check_spin = ttk.Spinbox(
+            top, from_=5, to=3600, textvariable=self.hold_check_sec_var,
+            width=6, state="disabled")
+        self.hold_check_spin.grid(row=0, column=8, padx=(4, 2))
+        ttk.Label(top, text="초").grid(row=0, column=9, sticky="w", padx=(0, 20))
+        ttk.Label(top, text="최대:").grid(row=0, column=10, sticky="w")
+        self.hold_max_spin = ttk.Spinbox(
+            top, from_=1, to=1440, textvariable=self.hold_max_min_var,
+            width=5, state="disabled")
+        self.hold_max_spin.grid(row=0, column=11, padx=(4, 2))
+        ttk.Label(top, text="분").grid(row=0, column=12, sticky="w")
+
+        ttk.Separator(outer, orient="horizontal").grid(
+            row=1, column=0, sticky="ew", pady=(6, 4))
+
+        # AND / OR 선택
+        logic_row = ttk.Frame(outer)
+        logic_row.grid(row=2, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(logic_row, text="조건 로직:").pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(logic_row, text="AND", variable=self.hold_logic_var,
+                        value="AND").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(logic_row, text="OR",  variable=self.hold_logic_var,
+                        value="OR").pack(side="left")
+
+        ttk.Separator(outer, orient="horizontal").grid(
+            row=3, column=0, sticky="ew", pady=(0, 4))
+
+        self._hold_cond_list_row = 4
+        self._hold_outer_ref = outer
+        self._refresh_hold_ui()
+        self._toggle_hold()   # 초기 비활성화 상태 적용
+
+    def _toggle_hold(self):
+        enabled = self.hold_enabled_var.get()
+        state   = "normal" if enabled else "disabled"
+        self.hold_rotate_spin.configure(state=state)
+        self.hold_keep_spin.configure(state=state)
+        self.hold_check_spin.configure(state=state)
+        self.hold_max_spin.configure(state=state)
+        # 조건 목록 버튼들 활성/비활성
+        for w in self._hold_outer_ref.grid_slaves():
+            row = int(w.grid_info().get("row", 0))
+            if row >= self._hold_cond_list_row:
+                for child in w.winfo_children() if hasattr(w, "winfo_children") else []:
+                    if isinstance(child, ttk.Button):
+                        child.configure(state=state)
+
+    def _refresh_hold_ui(self):
+        base = self._hold_cond_list_row
+        for w in self._hold_outer_ref.grid_slaves():
+            if int(w.grid_info().get("row", 0)) >= base:
+                w.destroy()
+
+        for i, cond in enumerate(self.hold_conditions):
+            row_f = ttk.Frame(self._hold_outer_ref)
+            row_f.grid(row=base + i, column=0, sticky="ew", pady=1)
+            row_f.columnconfigure(2, weight=1)
+            ttk.Label(row_f, text=f"{i+1}.", width=3).grid(row=0, column=0)
+            ttk.Label(row_f, text=f"[{cond['type']}]", width=10,
+                      foreground="#569cd6").grid(row=0, column=1, sticky="w")
+            ttk.Label(row_f, text=self._cond_summary(cond),
+                      anchor="w").grid(row=0, column=2, sticky="ew", padx=6)
+            ttk.Button(row_f, text="편집", width=6,
+                       command=lambda idx=i: self._edit_hold_condition(idx)).grid(row=0, column=3, padx=2)
+            ttk.Button(row_f, text="삭제", width=6,
+                       command=lambda idx=i: self._delete_hold_condition(idx)).grid(row=0, column=4)
+
+        add_row = ttk.Frame(self._hold_outer_ref)
+        add_row.grid(row=base + len(self.hold_conditions), column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(add_row, text="↺ 초기화",
+                   command=self._reset_hold_conditions).pack(side="left", padx=(0, 4))
+        ttk.Button(add_row, text="+ 조건 추가",
+                   command=self._add_hold_condition).pack(side="right")
+
+    def _add_hold_condition(self):
+        dlg = ConditionEditDialog(self.root)
+        if dlg.result:
+            self.hold_conditions.append(dlg.result)
+            self._refresh_hold_ui()
+
+    def _edit_hold_condition(self, idx):
+        dlg = ConditionEditDialog(self.root, self.hold_conditions[idx])
+        if dlg.result:
+            self.hold_conditions[idx] = dlg.result
+            self._refresh_hold_ui()
+
+    def _delete_hold_condition(self, idx):
+        if len(self.hold_conditions) <= 1:
+            messagebox.showwarning("경고", "조건은 최소 1개 이상이어야 합니다.", parent=self.root)
+            return
+        self.hold_conditions.pop(idx)
+        self._refresh_hold_ui()
+
+    def _reset_hold_conditions(self):
+        if messagebox.askyesno("초기화", "유지 조건을 기본값으로 초기화하시겠습니까?", parent=self.root):
+            self.hold_conditions = [dict(c) for c in DEFAULT_CONDITIONS]
+            self.hold_logic_var.set(DEFAULT_LOGIC)
+            self._refresh_hold_ui()
+
     def _build_controls(self, parent):
         frame = ttk.Frame(parent)
-        frame.grid(row=3, column=0, sticky="ew", pady=6)
+        frame.grid(row=4, column=0, sticky="ew", pady=6)
 
         self.start_btn = ttk.Button(frame, text="▶  START", command=self._start_test, width=14)
         self.start_btn.pack(side="left", padx=(0, 6))
@@ -1514,7 +1782,7 @@ class ClatTestGUI:
 
     def _build_log(self, parent):
         frame = ttk.LabelFrame(parent, text="로그 출력", padding=4, style="Section.TLabelframe")
-        frame.grid(row=4, column=0, sticky="nsew")
+        frame.grid(row=5, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
@@ -1640,9 +1908,17 @@ class ClatTestGUI:
         print(f"테스트 후 Windows 종료: {'예' if self.poweroff_var.get() else '아니오'}")
         print(f"저장 폴더: {save_dir}")
         print(f"로그 파일: {log_path}")
-        print(f"정상 조건 ({len(self.conditions)}개, 로직: {self.condition_logic_var.get()}):")
+        print(f"종료 조건 ({len(self.conditions)}개, 로직: {self.condition_logic_var.get()}):")
         for i, c in enumerate(self.conditions):
             print(f"  {i+1}. [{c['type']}] {self._cond_summary(c)}")
+        if self.hold_enabled_var.get():
+            print(f"유지 조건 ({len(self.hold_conditions)}개, 로직: {self.hold_logic_var.get()})  "
+                  f"저장 주기: {self.hold_rotate_min_var.get()}분 / 보관: {self.hold_keep_var.get()}개 / "
+                  f"체크 주기: {self.hold_check_sec_var.get()}초 / 최대: {self.hold_max_min_var.get()}분")
+            for i, c in enumerate(self.hold_conditions):
+                print(f"  {i+1}. [{c['type']}] {self._cond_summary(c)}")
+        else:
+            print("유지 조건: 사용 안 함")
         print()
 
         params = dict(
@@ -1661,6 +1937,13 @@ class ClatTestGUI:
             condition_logic=self.condition_logic_var.get(),
             test_steps=[dict(s) for s in self.test_steps],
             tcpdump_enabled=self.tcpdump_var.get(),
+            hold_enabled=self.hold_enabled_var.get(),
+            hold_conditions=[dict(c) for c in self.hold_conditions],
+            hold_condition_logic=self.hold_logic_var.get(),
+            hold_rotate_min=self.hold_rotate_min_var.get(),
+            hold_keep_files=self.hold_keep_var.get(),
+            hold_check_sec=self.hold_check_sec_var.get(),
+            hold_max_min=self.hold_max_min_var.get(),
         )
         self.test_thread = threading.Thread(target=self._run_thread, kwargs=params, daemon=True)
         self.test_thread.start()
